@@ -7,6 +7,7 @@ use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::KnownPlan as InternalKnownPlan;
 use codex_protocol::auth::PlanType as InternalPlanType;
 
+use async_trait::async_trait;
 use base64::Engine;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
@@ -266,6 +267,57 @@ fn external_auth_tokens_without_chatgpt_metadata_cannot_seed_chatgpt_auth() {
         err.to_string(),
         "external auth tokens are missing ChatGPT metadata"
     );
+}
+
+fn fake_jwt(payload: serde_json::Value) -> String {
+    let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+    let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+    format!("{header_b64}.{payload_b64}.sig")
+}
+
+#[derive(Clone)]
+struct StaticChatgptExternalAuth {
+    tokens: ExternalAuthTokens,
+}
+
+#[async_trait]
+impl ExternalAuth for StaticChatgptExternalAuth {
+    fn auth_mode(&self) -> AuthMode {
+        AuthMode::Chatgpt
+    }
+
+    async fn resolve(&self) -> std::io::Result<Option<ExternalAuthTokens>> {
+        Ok(Some(self.tokens.clone()))
+    }
+
+    async fn refresh(
+        &self,
+        _context: ExternalAuthRefreshContext,
+    ) -> std::io::Result<ExternalAuthTokens> {
+        Ok(self.tokens.clone())
+    }
+}
+
+#[tokio::test]
+async fn auth_manager_uses_external_chatgpt_tokens_when_resolved() {
+    let codex_home = tempdir().unwrap();
+    let jwt = fake_jwt(serde_json::json!({
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "account-123",
+        }
+    }));
+    let tokens = ExternalAuthTokens::chatgpt(jwt, "account-123", Some("plus".to_string()));
+
+    let manager = AuthManager::shared_with_external_auth(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        Arc::new(StaticChatgptExternalAuth { tokens }),
+    );
+
+    let auth = manager.auth().await.expect("auth should resolve");
+    assert_eq!(auth.is_external_chatgpt_tokens(), true);
+    assert_eq!(manager.auth_mode(), Some(AuthMode::Chatgpt));
 }
 
 #[tokio::test]

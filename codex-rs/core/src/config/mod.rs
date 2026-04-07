@@ -466,6 +466,20 @@ pub struct Config {
 
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
     pub chatgpt_base_url: String,
+    /// Optional externally managed ChatGPT access token used to call the
+    /// ChatGPT Codex backend (`chatgpt.com/backend-api/codex`).
+    ///
+    /// Prefer configuring this via `chatgpt_access_token_env` so secrets are not
+    /// stored in plaintext config files.
+    pub chatgpt_access_token: Option<String>,
+    /// Optional ChatGPT account id to send with `chatgpt-account-id`.
+    ///
+    /// When `chatgpt_access_token` is set, this may be omitted if the token is a
+    /// JWT containing a `chatgpt_account_id` claim.
+    pub chatgpt_account_id: Option<String>,
+    /// Optional plan type metadata forwarded alongside externally managed
+    /// ChatGPT tokens.
+    pub chatgpt_plan_type: Option<String>,
 
     /// Machine-local realtime audio device preferences used by realtime voice.
     pub realtime_audio: RealtimeAudioConfig,
@@ -1099,6 +1113,18 @@ pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::R
         .map_err(|err| std::io::Error::other(format!("failed to persist config.toml: {err}")))
 }
 
+fn read_env_trimmed(env_var: Option<&str>) -> Option<String> {
+    let env_var = env_var?;
+    let trimmed = env_var.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    std::env::var(trimmed)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentRoleConfig {
     /// Human-facing role documentation used in spawn tool guidance.
@@ -1729,6 +1755,31 @@ impl Config {
 
         let forced_login_method = cfg.forced_login_method;
 
+        let chatgpt_access_token = cfg
+            .chatgpt_access_token
+            .as_ref()
+            .and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then_some(trimmed.to_string())
+            })
+            .or_else(|| read_env_trimmed(cfg.chatgpt_access_token_env.as_deref()));
+        let chatgpt_account_id = cfg
+            .chatgpt_account_id
+            .as_ref()
+            .and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then_some(trimmed.to_string())
+            })
+            .or_else(|| read_env_trimmed(cfg.chatgpt_account_id_env.as_deref()));
+        let chatgpt_plan_type = cfg.chatgpt_plan_type.clone().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
         let model = model.or(config_profile.model).or(cfg.model);
         let service_tier = service_tier_override
             .unwrap_or_else(|| config_profile.service_tier.or(cfg.service_tier));
@@ -2016,6 +2067,9 @@ impl Config {
                 .chatgpt_base_url
                 .or(cfg.chatgpt_base_url)
                 .unwrap_or("https://chatgpt.com/backend-api/".to_string()),
+            chatgpt_access_token,
+            chatgpt_account_id,
+            chatgpt_plan_type,
             realtime_audio: cfg
                 .audio
                 .map_or_else(RealtimeAudioConfig::default, |audio| RealtimeAudioConfig {

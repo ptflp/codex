@@ -1246,6 +1246,9 @@ impl AuthManager {
     /// For stale managed ChatGPT auth, first performs a guarded reload and then
     /// refreshes only if the on-disk auth is unchanged.
     pub async fn auth(&self) -> Option<CodexAuth> {
+        if let Some(auth) = self.resolve_external_chatgpt_auth().await {
+            return Some(auth);
+        }
         if let Some(auth) = self.resolve_external_api_key_auth().await {
             return Some(auth);
         }
@@ -1456,6 +1459,10 @@ impl AuthManager {
         self.external_auth_mode() == Some(AuthMode::ApiKey)
     }
 
+    fn has_external_chatgpt_auth(&self) -> bool {
+        self.external_auth_mode() == Some(AuthMode::Chatgpt)
+    }
+
     async fn resolve_external_api_key_auth(&self) -> Option<CodexAuth> {
         if !self.has_external_api_key_auth() {
             return None;
@@ -1468,6 +1475,46 @@ impl AuthManager {
             Ok(None) => None,
             Err(err) => {
                 tracing::error!("Failed to resolve external API key auth: {err}");
+                None
+            }
+        }
+    }
+
+    async fn resolve_external_chatgpt_auth(&self) -> Option<CodexAuth> {
+        if !self.has_external_chatgpt_auth() {
+            return None;
+        }
+
+        let external_auth = self.external_auth()?;
+
+        match external_auth.resolve().await {
+            Ok(Some(tokens)) => {
+                let auth_dot_json = match AuthDotJson::from_external_tokens(&tokens) {
+                    Ok(auth_dot_json) => auth_dot_json,
+                    Err(err) => {
+                        tracing::error!("Failed to build external ChatGPT auth payload: {err}");
+                        return None;
+                    }
+                };
+
+                match CodexAuth::from_auth_dot_json(
+                    &self.codex_home,
+                    auth_dot_json,
+                    AuthCredentialsStoreMode::Ephemeral,
+                ) {
+                    Ok(auth) => {
+                        self.set_cached_auth(Some(auth.clone()));
+                        Some(auth)
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to parse external ChatGPT auth: {err}");
+                        None
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(err) => {
+                tracing::error!("Failed to resolve external ChatGPT auth: {err}");
                 None
             }
         }

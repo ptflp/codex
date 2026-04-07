@@ -156,6 +156,23 @@ pub struct ConfigToml {
     #[serde(default)]
     pub forced_login_method: Option<ForcedLoginMethod>,
 
+    /// EXPERIMENTAL: ChatGPT access token (discouraged; prefer env var indirection).
+    ///
+    /// When set, Codex will use this access token as externally managed ChatGPT auth.
+    /// This enables calling the ChatGPT Codex backend and listing ChatGPT-available models.
+    pub chatgpt_access_token: Option<String>,
+    /// EXPERIMENTAL: ChatGPT access token environment variable name.
+    ///
+    /// When set, Codex reads the token from this env var and uses it as externally
+    /// managed ChatGPT auth.
+    pub chatgpt_access_token_env: Option<String>,
+    /// EXPERIMENTAL: ChatGPT account id (used for `chatgpt-account-id` header).
+    pub chatgpt_account_id: Option<String>,
+    /// EXPERIMENTAL: ChatGPT account id environment variable name.
+    pub chatgpt_account_id_env: Option<String>,
+    /// EXPERIMENTAL: Optional ChatGPT plan type metadata (e.g. "plus", "pro").
+    pub chatgpt_plan_type: Option<String>,
+
     /// Preferred backend for storing CLI auth credentials.
     /// file (default): Use a file in the Codex home directory.
     /// keyring: Use an OS-specific keyring service.

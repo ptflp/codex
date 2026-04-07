@@ -75,6 +75,7 @@ use codex_login::default_client::USER_AGENT_SUFFIX;
 use codex_login::default_client::get_codex_user_agent;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_login::default_client::set_default_originator;
+use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
@@ -93,6 +94,7 @@ const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 struct ExternalAuthRefreshBridge {
     outgoing: Arc<OutgoingMessageSender>,
+    static_tokens: Option<ExternalAuthTokens>,
 }
 
 impl ExternalAuthRefreshBridge {
@@ -100,6 +102,49 @@ impl ExternalAuthRefreshBridge {
         match reason {
             ExternalAuthRefreshReason::Unauthorized => ChatgptAuthTokensRefreshReason::Unauthorized,
         }
+    }
+
+    fn static_tokens_from_config(config: &Config) -> Option<ExternalAuthTokens> {
+        let access_token = config.chatgpt_access_token.as_ref()?.trim();
+        if access_token.is_empty() {
+            return None;
+        }
+
+        let explicit_account_id = config.chatgpt_account_id.as_ref().and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then_some(trimmed.to_string())
+        });
+        let inferred_account_id = parse_chatgpt_jwt_claims(access_token)
+            .ok()
+            .and_then(|claims| claims.chatgpt_account_id)
+            .and_then(|value| {
+                let trimmed = value.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            });
+
+        let account_id = match explicit_account_id.or(inferred_account_id) {
+            Some(value) => value,
+            None => {
+                tracing::warn!(
+                    "chatgpt_access_token is set but chatgpt_account_id is missing and could not be inferred from the token; external ChatGPT auth tokens will be ignored"
+                );
+                return None;
+            }
+        };
+        let plan_type = config.chatgpt_plan_type.clone().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        Some(ExternalAuthTokens::chatgpt(
+            access_token,
+            account_id,
+            plan_type,
+        ))
     }
 }
 
@@ -109,10 +154,20 @@ impl ExternalAuth for ExternalAuthRefreshBridge {
         LoginAuthMode::Chatgpt
     }
 
+    async fn resolve(&self) -> std::io::Result<Option<ExternalAuthTokens>> {
+        Ok(self.static_tokens.clone())
+    }
+
     async fn refresh(
         &self,
         context: ExternalAuthRefreshContext,
     ) -> std::io::Result<ExternalAuthTokens> {
+        if self.static_tokens.is_some() {
+            return Err(std::io::Error::other(
+                "external ChatGPT token is configured as static; update it in config/env to refresh",
+            ));
+        }
+
         let params = ChatgptAuthTokensRefreshParams {
             reason: Self::map_reason(context.reason),
             previous_account_id: context.previous_account_id,
@@ -218,6 +273,7 @@ impl MessageProcessor {
         } = args;
         auth_manager.set_external_auth(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),
+            static_tokens: ExternalAuthRefreshBridge::static_tokens_from_config(config.as_ref()),
         }));
         let thread_manager = Arc::new(ThreadManager::new(
             config.as_ref(),
