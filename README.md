@@ -50,6 +50,37 @@ Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your 
 
 You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
 
+### Using the Chat Completions API (OpenAI-compatible providers)
+
+By default, Codex uses the Responses API. If you need to route requests through an OpenAI-compatible **Chat Completions** endpoint (`/v1/chat/completions`), configure a model provider with `wire_api = "chat_completions"` and point it at your desired base URL.
+
+Example `~/.codex/config.toml`:
+
+```toml
+model_provider = "openai_chat"
+model = "gpt-5.1"                # choose any Chat Completions model
+model_reasoning_effort = "low"   # none|minimal|low|medium|high|xhigh
+
+[model_providers.openai_chat]
+name = "OpenAI (Chat Completions)"
+base_url = "https://api.openai.com/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "chat_completions"
+requires_openai_auth = false
+supports_websockets = false
+```
+
+Then set your key:
+
+```shell
+export OPENAI_API_KEY="..."
+```
+
+Notes:
+
+- Chat Completions only supports `type: "function"` tools; other tool types are ignored.
+- `model_reasoning_effort` is sent as `reasoning_effort` for Chat Completions requests.
+
 ## Docs
 
 - [**Codex Documentation**](https://developers.openai.com/codex)

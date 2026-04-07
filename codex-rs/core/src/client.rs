@@ -31,6 +31,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use codex_api::ChatCompletionsClient as ApiChatCompletionsClient;
+use codex_api::ChatCompletionsOptions as ApiChatCompletionsOptions;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::MemoriesClient as ApiMemoriesClient;
@@ -68,12 +70,15 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_tools::create_tools_json_for_chat_completions_api;
 use codex_tools::create_tools_json_for_responses_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
@@ -82,6 +87,7 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
+use serde_json::Value;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -127,6 +133,7 @@ pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
     "x-responsesapi-include-timing-metrics";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 const RESPONSES_ENDPOINT: &str = "/responses";
+const CHAT_COMPLETIONS_ENDPOINT: &str = "/chat/completions";
 const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
 const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
 #[cfg(test)]
@@ -1155,6 +1162,165 @@ impl ModelClientSession {
         }
     }
 
+    /// Streams a turn via the OpenAI Chat Completions API.
+    ///
+    /// This is a compatibility shim for OpenAI-compatible providers that do
+    /// not implement the Responses API.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(
+        name = "model_client.stream_chat_completions_api",
+        level = "info",
+        skip_all,
+        fields(
+            model = %model_info.slug,
+            wire_api = %self.client.state.provider.wire_api,
+            transport = "chat_completions_http",
+            http.method = "POST",
+            api.path = "chat_completions",
+            turn.has_metadata_header = turn_metadata_header.is_some()
+        )
+    )]
+    async fn stream_chat_completions_api(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        turn_metadata_header: Option<&str>,
+    ) -> Result<ResponseStream> {
+        let auth_manager = self.client.state.auth_manager.clone();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(AuthManager::unauthorized_recovery);
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let request_auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                &client_setup.api_auth,
+                pending_retry,
+            );
+            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
+                session_telemetry,
+                request_auth_context,
+                RequestRouteTelemetry::for_endpoint(CHAT_COMPLETIONS_ENDPOINT),
+                self.client.state.auth_env_telemetry.clone(),
+            );
+
+            let body = self.build_chat_completions_request_body(prompt, model_info, effort)?;
+            let options = self.build_chat_completions_options(turn_metadata_header);
+
+            let client = ApiChatCompletionsClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+            )
+            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+
+            let stream_result = client.stream(body, options).await;
+            match stream_result {
+                Ok(stream) => {
+                    let (stream, _) = map_response_stream(stream, session_telemetry.clone());
+                    return Ok(stream);
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(
+                        handle_unauthorized(
+                            unauthorized_transport,
+                            &mut auth_recovery,
+                            session_telemetry,
+                        )
+                        .await?,
+                    );
+                    continue;
+                }
+                Err(err) => return Err(map_api_error(err)),
+            }
+        }
+    }
+
+    fn build_chat_completions_options(
+        &self,
+        turn_metadata_header: Option<&str>,
+    ) -> ApiChatCompletionsOptions {
+        let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
+        ApiChatCompletionsOptions {
+            conversation_id: Some(self.client.state.conversation_id.to_string()),
+            session_source: Some(self.client.state.session_source.clone()),
+            extra_headers: {
+                let mut headers = build_responses_headers(
+                    self.client.state.beta_features_header.as_deref(),
+                    Some(&self.turn_state),
+                    turn_metadata_header.as_ref(),
+                );
+                headers.extend(self.client.build_responses_identity_headers());
+                headers
+            },
+            compression: Compression::None,
+            turn_state: Some(Arc::clone(&self.turn_state)),
+        }
+    }
+
+    fn build_chat_completions_request_body(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+    ) -> Result<Value> {
+        let mut messages = Vec::new();
+        let instructions = prompt.base_instructions.text.trim();
+        if !instructions.is_empty() {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": instructions,
+            }));
+        }
+
+        for item in prompt.get_formatted_input() {
+            append_response_item_as_chat_messages(&mut messages, item);
+        }
+
+        let tools = create_tools_json_for_chat_completions_api(&prompt.tools).map_err(|err| {
+            CodexErr::InvalidRequest(format!("failed to encode chat completion tools: {err}"))
+        })?;
+
+        let mut body = serde_json::json!({
+            "model": model_info.slug,
+            "messages": messages,
+            "stream": true,
+            "stream_options": { "include_usage": true },
+        });
+
+        if let Some(effort) = effort {
+            body.as_object_mut()
+                .expect("chat completions body must be an object")
+                .insert(
+                    "reasoning_effort".to_string(),
+                    Value::String(effort.to_string()),
+                );
+        }
+
+        if !tools.is_empty() {
+            body.as_object_mut()
+                .expect("chat completions body must be an object")
+                .insert("tools".to_string(), Value::Array(tools));
+            body.as_object_mut()
+                .expect("chat completions body must be an object")
+                .insert("tool_choice".to_string(), Value::String("auto".to_string()));
+            body.as_object_mut()
+                .expect("chat completions body must be an object")
+                .insert(
+                    "parallel_tool_calls".to_string(),
+                    Value::Bool(prompt.parallel_tool_calls),
+                );
+        }
+
+        Ok(body)
+    }
+
     /// Streams a turn via the Responses API over WebSocket transport.
     #[allow(clippy::too_many_arguments)]
     #[instrument(
@@ -1411,6 +1577,16 @@ impl ModelClientSession {
                 )
                 .await
             }
+            WireApi::ChatCompletions => {
+                self.stream_chat_completions_api(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    effort,
+                    turn_metadata_header,
+                )
+                .await
+            }
         }
     }
 
@@ -1470,6 +1646,107 @@ fn build_responses_headers(
         headers.insert(X_CODEX_TURN_METADATA_HEADER, header_value.clone());
     }
     headers
+}
+
+fn append_response_item_as_chat_messages(messages: &mut Vec<Value>, item: ResponseItem) {
+    match item {
+        ResponseItem::Message { role, content, .. } => {
+            let role = match role.as_str() {
+                "system" | "developer" | "user" | "assistant" | "tool" => role,
+                _ => "user".to_string(),
+            };
+            messages.push(serde_json::json!({
+                "role": role,
+                "content": content_items_to_chat_content(&content),
+            }));
+        }
+        ResponseItem::FunctionCall {
+            name,
+            arguments,
+            call_id,
+            ..
+        } => {
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                }],
+            }));
+        }
+        ResponseItem::FunctionCallOutput { call_id, output } => {
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": tool_output_to_chat_content(&output),
+            }));
+        }
+        ResponseItem::CustomToolCall {
+            name,
+            input,
+            call_id,
+            ..
+        } => {
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": input },
+                }],
+            }));
+        }
+        ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        } => {
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": tool_output_to_chat_content(&output),
+            }));
+        }
+        _ => {}
+    }
+}
+
+fn content_items_to_chat_content(content: &[ContentItem]) -> Value {
+    let mut parts: Vec<Value> = Vec::new();
+    let mut text = String::new();
+
+    for item in content {
+        match item {
+            ContentItem::InputText { text: t } | ContentItem::OutputText { text: t } => {
+                text.push_str(t);
+            }
+            ContentItem::InputImage { image_url } => {
+                if !text.is_empty() {
+                    parts.push(serde_json::json!({ "type": "text", "text": text }));
+                    text = String::new();
+                }
+                parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": image_url },
+                }));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return Value::String(text);
+    }
+
+    if !text.is_empty() {
+        parts.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+
+    Value::Array(parts)
+}
+
+fn tool_output_to_chat_content(output: &FunctionCallOutputPayload) -> Value {
+    Value::String(output.body.to_text().unwrap_or_else(|| String::from("")))
 }
 
 fn subagent_header_value(session_source: &SessionSource) -> Option<String> {

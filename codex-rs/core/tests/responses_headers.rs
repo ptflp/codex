@@ -20,15 +20,38 @@ use core_test_support::responses;
 use core_test_support::test_codex::test_codex;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use tempfile::TempDir;
+use wiremock::Mock;
+use wiremock::ResponseTemplate;
 use wiremock::matchers::header;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 fn normalize_git_remote_url(url: &str) -> String {
-    let normalized = url.trim().trim_end_matches('/');
+    let mut normalized = url.trim().trim_end_matches('/').to_string();
+    if let Some(stripped) = normalized.strip_suffix(".git") {
+        normalized = stripped.to_string();
+    }
+
+    // Normalize common git remote URL formats so tests remain stable across
+    // user/system gitconfig rewrites (for example, https -> ssh).
+    if !normalized.contains("://")
+        && let Some((user_host, path)) = normalized.split_once(':')
+        && user_host.contains('@')
+        && let Some(host) = user_host.split_once('@').map(|(_, host)| host)
+    {
+        return format!("https://{host}/{}", path.trim_start_matches('/'));
+    }
+
+    for prefix in ["ssh://", "https://", "http://"] {
+        if let Some(rest) = normalized.strip_prefix(prefix) {
+            let rest = rest.strip_prefix("git@").unwrap_or(rest);
+            return format!("https://{}", rest.trim_start_matches('/'));
+        }
+    }
+
     normalized
-        .strip_suffix(".git")
-        .unwrap_or(normalized)
-        .to_string()
 }
 
 #[tokio::test]
@@ -261,6 +284,116 @@ async fn responses_stream_includes_subagent_header_on_other() {
         request.header("x-openai-subagent").as_deref(),
         Some("my-task")
     );
+}
+
+#[tokio::test]
+async fn chat_completions_request_includes_reasoning_effort() {
+    core_test_support::skip_if_no_network!();
+
+    let server = responses::start_mock_server().await;
+    let sse_body = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = ModelProviderInfo {
+        name: "mock".into(),
+        base_url: Some(format!("{}/v1", server.uri())),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        wire_api: WireApi::ChatCompletions,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+
+    let codex_home = TempDir::new().expect("failed to create TempDir");
+    let mut config = load_default_config_for_test(&codex_home).await;
+    let model = codex_core::test_support::get_model_offline(config.model.as_deref());
+    config.model = Some(model.clone());
+    let config = Arc::new(config);
+
+    let conversation_id = ThreadId::new();
+    let session_source = SessionSource::SubAgent(SubAgentSource::Review);
+    let model_info =
+        codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
+    let session_telemetry = SessionTelemetry::new(
+        conversation_id,
+        model.as_str(),
+        model_info.slug.as_str(),
+        /*account_id*/ None,
+        Some("test@test.com".to_string()),
+        Some(TelemetryAuthMode::Chatgpt),
+        "test_originator".to_string(),
+        /*log_user_prompts*/ false,
+        "test".to_string(),
+        session_source.clone(),
+    );
+
+    let client = ModelClient::new(
+        /*auth_manager*/ None,
+        conversation_id,
+        provider.clone(),
+        session_source,
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+    );
+    let mut client_session = client.new_session();
+
+    let mut prompt = Prompt::default();
+    prompt.input = vec![ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "hello".into(),
+        }],
+        end_turn: None,
+        phase: None,
+    }];
+
+    let mut stream = client_session
+        .stream(
+            &prompt,
+            &model_info,
+            &session_telemetry,
+            Some(codex_protocol::openai_models::ReasoningEffort::Low),
+            /*summary*/ ReasoningSummary::Auto,
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
+        )
+        .await
+        .expect("stream failed");
+    while let Some(event) = stream.next().await {
+        if matches!(event, Ok(ResponseEvent::Completed { .. })) {
+            break;
+        }
+    }
+
+    let requests = server.received_requests().await.expect("received requests");
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("body JSON");
+    assert_eq!(body["reasoning_effort"], "low");
 }
 
 #[tokio::test]

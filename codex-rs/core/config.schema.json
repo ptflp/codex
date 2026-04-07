@@ -1907,6 +1907,13 @@
             "responses"
           ],
           "type": "string"
+        },
+        {
+          "description": "OpenAI-compatible Chat Completions API at `/v1/chat/completions`.",
+          "enum": [
+            "chat_completions"
+          ],
+          "type": "string"
         }
       ]
     }
@@ -1973,8 +1980,28 @@
       "minimum": 0.0,
       "type": "integer"
     },
+    "chatgpt_access_token": {
+      "description": "EXPERIMENTAL: ChatGPT access token (discouraged; prefer env var indirection).\n\nWhen set, Codex will use this access token as externally managed ChatGPT auth. This enables calling the ChatGPT Codex backend and listing ChatGPT-available models.",
+      "type": "string"
+    },
+    "chatgpt_access_token_env": {
+      "description": "EXPERIMENTAL: ChatGPT access token environment variable name.\n\nWhen set, Codex reads the token from this env var and uses it as externally managed ChatGPT auth.",
+      "type": "string"
+    },
+    "chatgpt_account_id": {
+      "description": "EXPERIMENTAL: ChatGPT account id (used for `chatgpt-account-id` header).",
+      "type": "string"
+    },
+    "chatgpt_account_id_env": {
+      "description": "EXPERIMENTAL: ChatGPT account id environment variable name.",
+      "type": "string"
+    },
     "chatgpt_base_url": {
       "description": "Base URL for requests to ChatGPT (as opposed to the OpenAI API).",
+      "type": "string"
+    },
+    "chatgpt_plan_type": {
+      "description": "EXPERIMENTAL: Optional ChatGPT plan type metadata (e.g. \"plus\", \"pro\").",
       "type": "string"
     },
     "check_for_update_on_startup": {
