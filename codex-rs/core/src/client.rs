@@ -1271,7 +1271,11 @@ impl ModelClientSession {
         effort: Option<ReasoningEffortConfig>,
     ) -> Result<Value> {
         let mut messages = Vec::new();
-        let instructions = prompt.base_instructions.text.trim();
+        let instructions = prompt
+            .base_instructions
+            .as_ref()
+            .map(|instructions| instructions.text.trim())
+            .unwrap_or_default();
         if !instructions.is_empty() {
             messages.push(serde_json::json!({
                 "role": "system",
