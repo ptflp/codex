@@ -140,7 +140,11 @@ impl ExternalAuthRefreshBridge {
             }
         });
 
-        Some(ExternalAuthTokens::chatgpt(access_token, account_id, plan_type))
+        Some(ExternalAuthTokens::chatgpt(
+            access_token,
+            account_id,
+            plan_type,
+        ))
     }
 }
 
