@@ -1,5 +1,6 @@
 use crate::FreeformTool;
 use crate::JsonSchema;
+use crate::json_schema::AdditionalProperties;
 use crate::ResponsesApiTool;
 use codex_protocol::config_types::WebSearchConfig;
 use codex_protocol::config_types::WebSearchContextSize;
@@ -10,6 +11,7 @@ use codex_protocol::config_types::WebSearchUserLocationType;
 use codex_protocol::openai_models::WebSearchToolType;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 const WEB_SEARCH_TEXT_AND_IMAGE_CONTENT_TYPES: [&str; 2] = ["text", "image"];
 
@@ -163,12 +165,17 @@ pub fn create_tools_json_for_chat_completions_api(
     for tool in tools {
         match tool {
             ToolSpec::Function(function) => {
+                let parameters = if function.strict {
+                    normalize_schema_for_openai_strict(&function.parameters)
+                } else {
+                    function.parameters.clone()
+                };
                 tools_json.push(serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": &function.name,
                         "description": &function.description,
-                        "parameters": &function.parameters,
+                        "parameters": parameters,
                         "strict": function.strict,
                     }
                 }));
@@ -178,6 +185,47 @@ pub fn create_tools_json_for_chat_completions_api(
     }
 
     Ok(tools_json)
+}
+
+fn normalize_schema_for_openai_strict(schema: &JsonSchema) -> JsonSchema {
+    match schema {
+        JsonSchema::Object {
+            properties,
+            required,
+            additional_properties: _,
+        } => {
+            let normalized_props: BTreeMap<String, JsonSchema> = properties
+                .iter()
+                .map(|(key, value)| (key.clone(), normalize_schema_for_openai_strict(value)))
+                .collect();
+
+            let mut required_keys = required.clone().unwrap_or_default();
+            for key in normalized_props.keys() {
+                if !required_keys.iter().any(|existing| existing == key) {
+                    required_keys.push(key.clone());
+                }
+            }
+
+            JsonSchema::Object {
+                properties: normalized_props,
+                required: Some(required_keys),
+                additional_properties: Some(AdditionalProperties::Boolean(false)),
+            }
+        }
+        JsonSchema::Array { items, description } => JsonSchema::Array {
+            items: Box::new(normalize_schema_for_openai_strict(items)),
+            description: description.clone(),
+        },
+        JsonSchema::Boolean { description } => JsonSchema::Boolean {
+            description: description.clone(),
+        },
+        JsonSchema::String { description } => JsonSchema::String {
+            description: description.clone(),
+        },
+        JsonSchema::Number { description } => JsonSchema::Number {
+            description: description.clone(),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

@@ -30,6 +30,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::collections::HashSet;
 
 use codex_api::ChatCompletionsClient as ApiChatCompletionsClient;
 use codex_api::ChatCompletionsOptions as ApiChatCompletionsOptions;
@@ -1287,6 +1288,9 @@ impl ModelClientSession {
             append_response_item_as_chat_messages(&mut messages, item);
         }
 
+        sanitize_chat_completions_tool_call_pairs(&mut messages);
+        coalesce_chat_completions_messages(&mut messages);
+
         let tools = create_tools_json_for_chat_completions_api(&prompt.tools).map_err(|err| {
             CodexErr::InvalidRequest(format!("failed to encode chat completion tools: {err}"))
         })?;
@@ -1713,6 +1717,189 @@ fn append_response_item_as_chat_messages(messages: &mut Vec<Value>, item: Respon
             }));
         }
         _ => {}
+    }
+}
+
+fn sanitize_chat_completions_tool_call_pairs(messages: &mut Vec<Value>) {
+    // Chat Completions requires that any assistant message containing `tool_calls`
+    // is followed by tool messages responding to each `tool_call_id`.
+    //
+    // Codex should normally always have paired tool outputs, but in case the
+    // prompt history includes a dangling tool call (or stray tool outputs),
+    // we drop the invalid tool-call block rather than letting upstream reject
+    // the request with:
+    // "An assistant message with 'tool_calls' must be followed by tool messages…".
+    let mut idx = 0_usize;
+    while idx < messages.len() {
+        let Some(role) = messages[idx].get("role").and_then(Value::as_str) else {
+            idx += 1;
+            continue;
+        };
+
+        // Drop any stray tool message that doesn't belong to a tool-call block.
+        if role == "tool" {
+            let prev_is_tool_calls = idx > 0
+                && messages[idx - 1]
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some();
+            if !prev_is_tool_calls {
+                messages.remove(idx);
+                continue;
+            }
+        }
+
+        if role != "assistant" {
+            idx += 1;
+            continue;
+        }
+
+        let Some(tool_calls) = messages[idx].get("tool_calls").and_then(Value::as_array) else {
+            idx += 1;
+            continue;
+        };
+
+        let expected_ids: HashSet<String> = tool_calls
+            .iter()
+            .filter_map(|call| call.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        if expected_ids.is_empty() {
+            idx += 1;
+            continue;
+        }
+
+        // Scan contiguous tool messages immediately following this assistant tool call message.
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut end = idx + 1;
+        while end < messages.len() {
+            let Some(next_role) = messages[end].get("role").and_then(Value::as_str) else {
+                break;
+            };
+            if next_role != "tool" {
+                break;
+            }
+            let tool_call_id = messages[end]
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(tool_call_id) = tool_call_id {
+                if expected_ids.contains(&tool_call_id) {
+                    seen_ids.insert(tool_call_id);
+                } else {
+                    // Tool message not tied to this block; drop it.
+                    messages.remove(end);
+                    continue;
+                }
+            } else {
+                // Tool message without an id is invalid for Chat Completions; drop it.
+                messages.remove(end);
+                continue;
+            }
+            end += 1;
+        }
+
+        if seen_ids.len() != expected_ids.len() {
+            // Drop the assistant tool call + all contiguous tool messages we just scanned.
+            messages.drain(idx..end);
+            continue;
+        }
+
+        idx = end;
+    }
+}
+
+fn coalesce_chat_completions_messages(messages: &mut Vec<Value>) {
+    // Some OpenAI-compatible providers (vLLM/Ollama/LM Studio templates) require
+    // strict user↔assistant alternation and can error when multiple consecutive
+    // messages share the same role. OpenClaude performs a coalescing pass to
+    // merge consecutive `user`/`assistant` messages while keeping `tool` and
+    // `system` boundaries intact.
+    //
+    // Multiple consecutive `tool` messages are allowed (assistant → tool* → user).
+    let mut coalesced: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages.drain(..) {
+        let Some(role) = msg.get("role").and_then(Value::as_str) else {
+            coalesced.push(msg);
+            continue;
+        };
+
+        let Some(prev) = coalesced.last_mut() else {
+            coalesced.push(msg);
+            continue;
+        };
+
+        let prev_role = prev.get("role").and_then(Value::as_str);
+        let can_merge = prev_role == Some(role)
+            && role != "tool"
+            && role != "system"
+            && role != "developer";
+        if !can_merge {
+            coalesced.push(msg);
+            continue;
+        }
+
+        merge_chat_completions_message(prev, msg);
+    }
+
+    *messages = coalesced;
+}
+
+fn merge_chat_completions_message(into: &mut Value, from: Value) {
+    fn content_to_parts(content: &Value) -> Vec<Value> {
+        match content {
+            Value::Null => Vec::new(),
+            Value::String(text) => {
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![serde_json::json!({ "type": "text", "text": text })]
+                }
+            }
+            Value::Array(parts) => parts.clone(),
+            other => vec![serde_json::json!({ "type": "text", "text": other.to_string() })],
+        }
+    }
+
+    let (Some(into_obj), Some(from_obj)) = (into.as_object_mut(), from.as_object()) else {
+        return;
+    };
+
+    let into_content = into_obj.get("content").cloned().unwrap_or(Value::Null);
+    let from_content = from_obj.get("content").cloned().unwrap_or(Value::Null);
+
+    // Prefer preserving plain-string content when possible to keep requests compact.
+    match (&into_content, &from_content) {
+        (Value::Null, Value::Null) => {}
+        (Value::Null, _) => {
+            into_obj.insert("content".to_string(), from_content);
+        }
+        (_, Value::Null) => {}
+        (Value::String(a), Value::String(b)) => {
+            let merged = if a.is_empty() {
+                b.clone()
+            } else if b.is_empty() {
+                a.clone()
+            } else {
+                format!("{a}\n{b}")
+            };
+            into_obj.insert("content".to_string(), Value::String(merged));
+        }
+        _ => {
+            let mut parts = content_to_parts(&into_content);
+            parts.extend(content_to_parts(&from_content));
+            into_obj.insert("content".to_string(), Value::Array(parts));
+        }
+    }
+
+    if let Some(from_calls) = from_obj.get("tool_calls").and_then(Value::as_array) {
+        if !from_calls.is_empty() {
+            let entry = into_obj
+                .entry("tool_calls".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Value::Array(into_calls) = entry {
+                into_calls.extend(from_calls.iter().cloned());
+            }
+        }
     }
 }
 
